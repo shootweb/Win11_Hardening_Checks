@@ -1,382 +1,327 @@
-<#
- Non admin security posture checklist
+<# 
+  check_win11_hardening_nonadmin.ps1
 
- It will:
-   • Run everything that works for a standard user
-   • Automatically skip checks that are better done with admin rights
-   • Write a txt report in the current directory
+  Non admin hardening checks for Windows 11.
+  It will automatically skip checks that require elevation.
 #>
 
-# Helper: are we running as admin?
-$IsAdmin = ([Security.Principal.WindowsPrincipal] `
-    [Security.Principal.WindowsIdentity]::GetCurrent()
-).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+param(
+    [string]$OutputPath = "$env:USERPROFILE\Desktop\win11_hardening_nonadmin_results.txt"
+)
 
+# Helper to track results
 $results = @()
 
 function Add-Result {
     param(
         [string]$Name,
-        [string]$Status,
+        [string]$Status,   # PASS, FAIL, SKIPPED, UNKNOWN, INFO
         [string]$Details
     )
 
-    $results += [pscustomobject]@{
+    $obj = [pscustomobject]@{
         Check   = $Name
         Status  = $Status
         Details = $Details
     }
+    $script:results += $obj
+    $line = "[{0}] {1}: {2}" -f $Status, $Name, $Details
+    Write-Output $line
 }
 
-############################################################
-# VBS, HVCI, Credential Guard
-############################################################
-
+# Detect privilege level
 try {
-    $dg = Get-CimInstance -ClassName Win32_DeviceGuard `
-        -Namespace root\Microsoft\Windows\DeviceGuard -ErrorAction Stop
-
-    $vbsRunning = $dg.VirtualizationBasedSecurityStatus -eq 2
-    $hvciOn     = $dg.SecurityServicesRunning -contains 2
-    $cgOn       = $dg.SecurityServicesRunning -contains 1
-
-    Add-Result "VBS enabled" `
-        ($(if ($vbsRunning) { "PASS" } else { "FAIL" })) `
-        ("VirtualizationBasedSecurityStatus = {0}" -f $dg.VirtualizationBasedSecurityStatus)
-
-    Add-Result "HVCI enabled" `
-        ($(if ($hvciOn) { "PASS" } else { "FAIL" })) `
-        ("SecurityServicesRunning = {0}" -f ($dg.SecurityServicesRunning -join ","))
-
-    Add-Result "Credential Guard enabled" `
-        ($(if ($cgOn) { "PASS" } else { "FAIL" })) `
-        ("SecurityServicesRunning = {0}" -f ($dg.SecurityServicesRunning -join ","))
-
-}
-catch {
-    Add-Result "VBS, HVCI, Credential Guard" "UNKNOWN" `
-        ("Could not query Win32_DeviceGuard: {0}" -f $_.Exception.Message)
+    $currentIdentity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal        = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+    $isAdmin          = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch {
+    $isAdmin = $false
 }
 
-############################################################
-# BitLocker (admin friendly, skipped for non admin)
-############################################################
+Add-Result -Name "Privilege level" -Status "INFO" -Details ($(if ($isAdmin) { "Running with admin rights" } else { "Running as standard user" }))
 
-if (-not $IsAdmin) {
-    Add-Result "BitLocker OS volume" "SKIPPED" `
-        "Admin rights recommended to query BitLocker status reliably"
-}
-else {
+########## Checks ##########
+
+function Test-VbsHvci {
+    $name = "VBS and HVCI"
     try {
-        $blv = Get-BitLockerVolume -MountPoint "C:" -ErrorAction Stop
-        $protected = ($blv.ProtectionStatus -eq "On" -or $blv.ProtectionStatus -eq 1)
+        $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace "root\Microsoft\Windows\DeviceGuard" -ErrorAction Stop
 
-        Add-Result "BitLocker OS volume" `
-            ($(if ($protected) { "PASS" } else { "FAIL" })) `
-            ("ProtectionStatus = {0}" -f $blv.ProtectionStatus)
-    }
-    catch {
-        Add-Result "BitLocker OS volume" "UNKNOWN" `
-            ("Error querying BitLocker: {0}" -f $_.Exception.Message)
-    }
-}
+        $vbsOn          = ($dg.VirtualizationBasedSecurityStatus -eq 2)
+        $hvciConfigured = ($dg.SecurityServicesConfigured -contains 1)
+        $hvciRunning    = ($dg.SecurityServicesRunning   -contains 1)
 
-############################################################
-# LSA protection
-############################################################
-
-try {
-    $lsaKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
-    $props  = Get-ItemProperty -Path $lsaKey -ErrorAction Stop
-
-    $runAsPpl     = $props.RunAsPPL
-    $runAsPplBoot = $props.RunAsPPLBoot
-    $lsaProtected = ($runAsPpl -ge 1) -or ($runAsPplBoot -ge 1)
-
-    $details = "RunAsPPL={0} RunAsPPLBoot={1}" -f $runAsPpl, $runAsPplBoot
-
-    Add-Result "LSA protection" `
-        ($(if ($lsaProtected) { "PASS" } else { "FAIL" })) `
-        $details
-}
-catch {
-    Add-Result "LSA protection" "UNKNOWN" `
-        ("Error reading LSA registry: {0}" -f $_.Exception.Message)
-}
-
-############################################################
-# No saved credentials (cmdkey)
-############################################################
-
-try {
-    $cmdkeyOutput = cmdkey /list 2>&1
-    $targetLines  = $cmdkeyOutput | Where-Object { $_ -match "^\s*Target:" }
-
-    if (-not $targetLines) {
-        Add-Result "No saved credentials (cmdkey)" "PASS" `
-            "No cmdkey stored targets found"
-    }
-    else {
-        Add-Result "No saved credentials (cmdkey)" "FAIL" `
-            ("Found stored credentials:`n{0}" -f ($targetLines -join "`n"))
+        if ($vbsOn -and $hvciConfigured -and $hvciRunning) {
+            Add-Result $name "PASS" "VBS and HVCI appear to be enabled"
+        } else {
+            Add-Result $name "FAIL" ("VBSOn={0} HVCIConfigured={1} HVCIRunning={2}" -f $vbsOn, $hvciConfigured, $hvciRunning)
+        }
+    } catch {
+        Add-Result $name "UNKNOWN" "Could not query DeviceGuard: $($_.Exception.Message)"
     }
 }
-catch {
-    Add-Result "No saved credentials (cmdkey)" "UNKNOWN" `
-        ("Error running cmdkey: {0}" -f $_.Exception.Message)
-}
 
-############################################################
-# AppLocker or WDAC (skipped for non admin)
-############################################################
-
-if (-not $IsAdmin) {
-    Add-Result "AppLocker or WDAC" "SKIPPED" `
-        "Admin rights recommended to query effective AppLocker or WDAC policy"
-}
-else {
+function Test-CredentialGuard {
+    $name = "Credential Guard"
     try {
-        $wdacFiles = Get-ChildItem -Path "C:\Windows\System32\CodeIntegrity" `
-            -Include "*.cip","CiPoliciesActive*" -File -ErrorAction SilentlyContinue
+        $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace "root\Microsoft\Windows\DeviceGuard" -ErrorAction Stop
 
-        $appLocker = Get-AppLockerPolicy -Effective -ErrorAction SilentlyContinue
+        $cgConfigured = ($dg.SecurityServicesConfigured -contains 2)
+        $cgRunning    = ($dg.SecurityServicesRunning   -contains 2)
 
-        $hasPolicy = $wdacFiles -or $appLocker
-
-        $detail = @()
-        if ($wdacFiles) { $detail += "WDAC policy files present" }
-        if ($appLocker) { $detail += "AppLocker effective policy returned" }
-        if (-not $detail) { $detail = "No WDAC or AppLocker policy detected" }
-
-        Add-Result "AppLocker or WDAC" `
-            ($(if ($hasPolicy) { "PASS" } else { "FAIL" })) `
-            ($detail -join "; ")
-    }
-    catch {
-        Add-Result "AppLocker or WDAC" "UNKNOWN" `
-            ("Error checking AppLocker or WDAC: {0}" -f $_.Exception.Message)
+        if ($cgConfigured -and $cgRunning) {
+            Add-Result $name "PASS" "Credential Guard appears to be enabled and running"
+        } else {
+            Add-Result $name "FAIL" ("Configured={0} Running={1}" -f $cgConfigured, $cgRunning)
+        }
+    } catch {
+        Add-Result $name "UNKNOWN" "Could not query DeviceGuard: $($_.Exception.Message)"
     }
 }
 
-############################################################
-# ASR rules (Defender) skipped for non admin
-############################################################
-
-if (-not $IsAdmin) {
-    Add-Result "ASR rules" "SKIPPED" `
-        "Admin rights recommended to query Defender ASR configuration"
-}
-else {
+function Test-BitLocker {
+    $name = "BitLocker OS drive"
     try {
-        $mp = Get-MpPreference
+        # This often needs admin, so be graceful
+        $vol = Get-BitLockerVolume -MountPoint "C:" -ErrorAction Stop
+        if ($null -ne $vol -and $vol.VolumeStatus -eq "FullyEncrypted") {
+            Add-Result $name "PASS" "C drive fully encrypted"
+        } else {
+            Add-Result $name "FAIL" ("BitLocker status for C drive is {0}" -f $vol.VolumeStatus)
+        }
+    } catch {
+        Add-Result $name "SKIPPED" "BitLocker check requires admin rights or BitLocker module not available: $($_.Exception.Message)"
+    }
+}
 
-        $asrIds     = $mp.AttackSurfaceReductionRules_Ids
-        $asrActions = $mp.AttackSurfaceReductionRules_Actions
+function Test-LsaProtection {
+    $name = "LSA protection (RunAsPPL)"
+    try {
+        $lsaKeyPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+        $val = Get-ItemProperty -Path $lsaKeyPath -Name "RunAsPPL" -ErrorAction Stop | Select-Object -ExpandProperty RunAsPPL
+        if ($val -eq 1 -or $val -eq 2) {
+            Add-Result $name "PASS" "LSA protection enabled (RunAsPPL=$val)"
+        } else {
+            Add-Result $name "FAIL" "RunAsPPL value is $val"
+        }
+    } catch {
+        Add-Result $name "UNKNOWN" "Could not read LSA registry value: $($_.Exception.Message)"
+    }
+}
 
-        if ($asrIds) {
-            $enabled = @()
-            for ($i = 0; $i -lt $asrIds.Count; $i++) {
-                # 1 is usually block
-                if ($asrActions[$i] -eq 1) {
-                    $enabled += $asrIds[$i]
+function Test-NoSavedCreds {
+    $name = "Saved credentials (cmdkey)"
+    try {
+        $output = cmdkey /list 2>&1
+        # On a fresh system, cmdkey still prints some built in targets
+        $saved = $output | Where-Object { $_ -match "Target:" }
+
+        if ($saved.Count -gt 0) {
+            Add-Result $name "FAIL" ("Found saved credentials: {0}" -f ($saved -join " | "))
+        } else {
+            Add-Result $name "PASS" "No saved credentials listed for this user"
+        }
+    } catch {
+        Add-Result $name "UNKNOWN" "Error running cmdkey: $($_.Exception.Message)"
+    }
+}
+
+function Test-AppLockerWdac {
+    $name = "AppLocker or WDAC"
+    try {
+        # Best effort for AppLocker policies
+        $applockerKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SrpV2"
+        if (Test-Path $applockerKey) {
+            Add-Result $name "PASS" "AppLocker policy key present"
+            return
+        }
+
+        # Best effort for WDAC (CodeIntegrity)
+        $ciKey = "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy"
+        if (Test-Path $ciKey) {
+            Add-Result $name "PASS" "WDAC Code Integrity policy key present"
+            return
+        }
+
+        Add-Result $name "FAIL" "No obvious AppLocker or WDAC policy keys found"
+    } catch {
+        Add-Result $name "UNKNOWN" "Could not query AppLocker or WDAC registry: $($_.Exception.Message)"
+    }
+}
+
+function Test-ASRRules {
+    $name = "Defender ASR rules"
+    try {
+        $pref = Get-MpPreference -ErrorAction Stop
+        $ids     = $pref.AttackSurfaceReductionRules_Ids
+        $actions = $pref.AttackSurfaceReductionRules_Actions
+
+        if ($ids -and $actions) {
+            # 1 or 6 means enabled
+            $enabledCount = 0
+            for ($i = 0; $i -lt $ids.Count; $i++) {
+                if ($actions[$i] -eq 1 -or $actions[$i] -eq 6) {
+                    $enabledCount++
                 }
             }
-
-            if ($enabled.Count -gt 0) {
-                Add-Result "ASR rules" "PASS" `
-                    ("Enabled rule ids: {0}" -f ($enabled -join ","))
+            if ($enabledCount -gt 0) {
+                Add-Result $name "PASS" "$enabledCount ASR rules enabled"
+            } else {
+                Add-Result $name "FAIL" "No ASR rules appear to be enabled"
             }
-            else {
-                Add-Result "ASR rules" "FAIL" `
-                    "No ASR rules in block mode"
-            }
+        } else {
+            Add-Result $name "FAIL" "No ASR rules configured"
         }
-        else {
-            Add-Result "ASR rules" "FAIL" `
-                "No ASR rules configured"
-        }
-    }
-    catch {
-        Add-Result "ASR rules" "UNKNOWN" `
-            ("Error reading Defender preferences: {0}" -f $_.Exception.Message)
+    } catch {
+        Add-Result $name "UNKNOWN" "Could not read Defender preferences: $($_.Exception.Message)"
     }
 }
 
-############################################################
-# Writable service paths (marked as admin style check)
-############################################################
+function Test-WritableServicePaths {
+    $name = "Writable service paths"
+    if (-not $isAdmin) {
+        Add-Result $name "SKIPPED" "Service binary ACL checks generally require admin rights"
+        return
+    }
 
-if (-not $IsAdmin) {
-    Add-Result "No writable service paths" "SKIPPED" `
-        "Service path writeability check is best done with admin rights"
-}
-else {
     try {
-        # Very quick heuristic, not a full audit
-        $writable = @()
-
-        $services = Get-CimInstance Win32_Service -ErrorAction Stop
-        foreach ($svc in $services) {
-            if (-not $svc.PathName) { continue }
-
-            $exePath = $svc.PathName.Trim('"')
-            $exePath = $exePath.Split(" ")[0]
-
-            if (-not (Test-Path $exePath)) { continue }
-
-            $dir = Split-Path $exePath -Parent
-            try {
-                $acl = Get-Acl $dir
-            }
-            catch {
-                continue
-            }
-
-            $badAce = $acl.Access | Where-Object {
-                ($_.FileSystemRights.ToString() -match "Write" -or $_.FileSystemRights.ToString() -match "Modify") -and
-                ($_.IdentityReference -match "Everyone" -or
-                 $_.IdentityReference -match "Users" -or
-                 $_.IdentityReference -match "Authenticated Users")
-            }
-
-            if ($badAce) {
-                $writable += $svc.Name
+        $suspect = @()
+        $services = Get-CimInstance -ClassName Win32_Service -ErrorAction Stop
+        foreach ($s in $services) {
+            if ($s.PathName -and -not $s.PathName.StartsWith('"')) {
+                $suspect += $s.Name
             }
         }
 
-        if ($writable.Count -eq 0) {
-            Add-Result "No writable service paths" "PASS" `
-                "No obviously writable service directories for low privileged users (heuristic)"
+        if ($suspect.Count -gt 0) {
+            Add-Result $name "FAIL" ("Services with non quoted paths: {0}" -f ($suspect -join ", "))
+        } else {
+            Add-Result $name "PASS" "No obvious non quoted service paths found"
         }
-        else {
-            Add-Result "No writable service paths" "FAIL" `
-                ("Potentially writable service dirs for low privilege: {0}" -f ($writable -join ","))
+    } catch {
+        Add-Result $name "UNKNOWN" "Could not enumerate service paths: $($_.Exception.Message)"
+    }
+}
+
+function Test-EDR {
+    $name = "CrowdStrike and Guardicore"
+    try {
+        $services = Get-Service -ErrorAction Stop
+
+        $cs = $services | Where-Object { $_.Name -like "CSAgent*" -or $_.DisplayName -like "*CrowdStrike*" }
+        $gc = $services | Where-Object { $_.DisplayName -like "*Guardicore*" -or $_.Name -like "*Guardicore*" -or $_.Name -like "*Illumio*" }
+
+        $details = @()
+        if ($cs) {
+            $details += ("CrowdStrike services: {0}" -f (($cs | ForEach-Object { "$($_.Name)($($_.Status))" }) -join ", "))
+        } else {
+            $details += "CrowdStrike service not found"
         }
-    }
-    catch {
-        Add-Result "No writable service paths" "UNKNOWN" `
-            ("Error while checking service paths: {0}" -f $_.Exception.Message)
+
+        if ($gc) {
+            $details += ("Guardicore services: {0}" -f (($gc | ForEach-Object { "$($_.Name)($($_.Status))" }) -join ", "))
+        } else {
+            $details += "Guardicore service not found"
+        }
+
+        if ($cs -and $gc -and ($cs | Where-Object Status -eq "Running") -and ($gc | Where-Object Status -eq "Running")) {
+            Add-Result $name "PASS" ($details -join " | ")
+        } else {
+            Add-Result $name "FAIL" ($details -join " | ")
+        }
+    } catch {
+        Add-Result $name "UNKNOWN" "Could not query EDR services: $($_.Exception.Message)"
     }
 }
 
-############################################################
-# CrowdStrike and Guardicore enforcing
-############################################################
+function Test-LocalUsersMinimal {
+    $name = "Local users minimal"
+    if (-not $isAdmin) {
+        Add-Result $name "SKIPPED" "Local user enumeration usually needs admin or special rights"
+        return
+    }
+
+    try {
+        $users = Get-LocalUser -ErrorAction Stop
+        $enabled = $users | Where-Object { $_.Enabled }
+        Add-Result $name "INFO" ("Enabled local users count: {0}. Review manually." -f $enabled.Count)
+    } catch {
+        Add-Result $name "UNKNOWN" "Could not enumerate local users: $($_.Exception.Message)"
+    }
+}
+
+function Test-UnnecessarySoftware {
+    $name = "Unnecessary software"
+    try {
+        # Simple count from uninstall keys in both hives
+        $paths = @(
+            "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+            "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+        )
+
+        $apps = @()
+        foreach ($p in $paths) {
+            if (Test-Path $p) {
+                $apps += Get-ItemProperty -Path "$p\*" -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName }
+            }
+        }
+
+        $count = $apps.Count
+        Add-Result $name "INFO" ("Installed entries counted: {0}. Manual review required for bloat or risky tools." -f $count)
+    } catch {
+        Add-Result $name "UNKNOWN" "Could not enumerate installed software: $($_.Exception.Message)"
+    }
+}
+
+function Test-ListeningPorts {
+    $name = "Listening ports"
+    try {
+        $connections = Get-NetTCPConnection -State Listen -ErrorAction Stop
+        # Simple summary only, manual analysis needed
+        $summary = $connections |
+            Group-Object -Property LocalPort |
+            Sort-Object -Property Count -Descending |
+            Select-Object -First 20 |
+            ForEach-Object { "Port {0} Count {1}" -f $_.Name, $_.Count }
+
+        if ($summary.Count -eq 0) {
+            Add-Result $name "PASS" "No listening TCP ports reported"
+        } else {
+            Add-Result $name "INFO" ("Listening ports summary: {0}" -f ($summary -join " | "))
+        }
+    } catch {
+        Add-Result $name "UNKNOWN" "Could not query TCP listeners: $($_.Exception.Message)"
+    }
+}
+
+########## Run all checks ##########
+
+Test-VbsHvci
+Test-CredentialGuard
+Test-BitLocker
+Test-LsaProtection
+Test-NoSavedCreds
+Test-AppLockerWdac
+Test-ASRRules
+Test-WritableServicePaths
+Test-EDR
+Test-LocalUsersMinimal
+Test-UnnecessarySoftware
+Test-ListeningPorts
+
+########## Write output file ##########
 
 try {
-    $csSvc = Get-Service -ErrorAction SilentlyContinue | Where-Object {
-        $_.Name -match "CSFalcon" -or $_.DisplayName -match "CrowdStrike"
+    $header = "Windows 11 hardening check run on {0}" -f (Get-Date)
+    $header | Out-File -FilePath $OutputPath -Encoding UTF8
+
+    foreach ($r in $results) {
+        $line = "[{0}] {1}: {2}" -f $r.Status, $r.Check, $r.Details
+        Add-Content -Path $OutputPath -Value $line
     }
 
-    $gcSvc = Get-Service -ErrorAction SilentlyContinue | Where-Object {
-        $_.DisplayName -match "Guardicore" -or $_.Name -match "Guardicore"
-    }
-
-    $csOn = $csSvc -and ($csSvc.Status -eq "Running")
-    $gcOn = $gcSvc -and ($gcSvc.Status -eq "Running")
-
-    $detail = @()
-    if ($csSvc) { $detail += "CrowdStrike: {0} ({1})" -f $csSvc.Status, $csSvc.Name }
-    else       { $detail += "CrowdStrike service not found" }
-
-    if ($gcSvc) { $detail += "Guardicore: {0} ({1})" -f $gcSvc.Status, $gcSvc.Name }
-    else        { $detail += "Guardicore service not found" }
-
-    $bothOn = $csOn -and $gcOn
-
-    Add-Result "CrowdStrike and Guardicore enforcing" `
-        ($(if ($bothOn) { "PASS" } else { "FAIL" })) `
-        ($detail -join " ; ")
+    Write-Output "`nResults written to: $OutputPath"
+} catch {
+    Write-Output "Failed to write results to file: $($_.Exception.Message)"
 }
-catch {
-    Add-Result "CrowdStrike and Guardicore enforcing" "UNKNOWN" `
-        ("Error checking EDR services: {0}" -f $_.Exception.Message)
-}
-
-############################################################
-# Local users minimal
-############################################################
-
-try {
-    $enabledUsers = Get-LocalUser -ErrorAction Stop | Where-Object { $_.Enabled -eq $true }
-    $names        = $enabledUsers.Name -join ", "
-
-    Add-Result "Local users minimal" "INFO" `
-        ("Enabled local users count = {0} ({1}) - manual review" -f $enabledUsers.Count, $names)
-}
-catch {
-    Add-Result "Local users minimal" "UNKNOWN" `
-        ("Error listing local users: {0}" -f $_.Exception.Message)
-}
-
-############################################################
-# No unnecessary software
-############################################################
-
-try {
-    $uninstallPaths = @(
-        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
-        "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
-    )
-
-    $apps = Get-ItemProperty -Path $uninstallPaths -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName } |
-        Sort-Object DisplayName -Unique
-
-    Add-Result "No unnecessary software" "INFO" `
-        ("Installed products count = {0} - manual review required" -f $apps.Count)
-}
-catch {
-    Add-Result "No unnecessary software" "UNKNOWN" `
-        ("Error enumerating installed software: {0}" -f $_.Exception.Message)
-}
-
-############################################################
-# No listening ports besides essential services
-############################################################
-
-try {
-    $listeners = Get-NetTCPConnection -State Listen -ErrorAction Stop
-
-    $loopbackOnly = $listeners | Where-Object {
-        $_.LocalAddress -in @("127.0.0.1", "::1")
-    }
-
-    $nonLoopback = $listeners | Where-Object {
-        $_.LocalAddress -notin @("127.0.0.1", "::1")
-    }
-
-    if (-not $nonLoopback) {
-        Add-Result "Listening ports limited" "PASS" `
-            ("Only loopback listeners present: count = {0}" -f $loopbackOnly.Count)
-    }
-    else {
-        $detail = $nonLoopback | Select-Object LocalAddress,LocalPort,OwningProcess |
-            Format-Table -AutoSize | Out-String
-
-        Add-Result "Listening ports limited" "FAIL" `
-            ("Non loopback listeners present:`n{0}" -f $detail.Trim())
-    }
-}
-catch {
-    Add-Result "Listening ports limited" "UNKNOWN" `
-        ("Error querying listening ports: {0}" -f $_.Exception.Message)
-}
-
-############################################################
-# Write report
-############################################################
-
-$timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-$outPath   = Join-Path -Path (Get-Location) -ChildPath ("Win11_SecurityChecklist_nonAdmin_{0}.txt" -f $timestamp)
-
-$lines = $results | ForEach-Object {
-    "{0}: {1} - {2}" -f $_.Check, $_.Status, $_.Details
-}
-
-$lines | Out-File -FilePath $outPath -Encoding UTF8
-
-Write-Host ""
-Write-Host "Checklist finished."
-Write-Host "Admin mode: $IsAdmin"
-Write-Host "Report written to: $outPath"
