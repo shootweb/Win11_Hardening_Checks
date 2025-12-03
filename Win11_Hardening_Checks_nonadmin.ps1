@@ -1,4 +1,4 @@
-<# 
+ <#
   check_win11_hardening_nonadmin.ps1
 
   Non admin hardening checks for Windows 11.
@@ -48,8 +48,8 @@ function Test-VbsHvci {
         $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace "root\Microsoft\Windows\DeviceGuard" -ErrorAction Stop
 
         $vbsOn          = ($dg.VirtualizationBasedSecurityStatus -eq 2)
-        $hvciConfigured = ($dg.SecurityServicesConfigured -contains 1)
-        $hvciRunning    = ($dg.SecurityServicesRunning   -contains 1)
+        $hvciConfigured = ($dg.SecurityServicesConfigured -contains 2)
+        $hvciRunning    = ($dg.SecurityServicesRunning   -contains 2)
 
         if ($vbsOn -and $hvciConfigured -and $hvciRunning) {
             Add-Result $name "PASS" "VBS and HVCI appear to be enabled"
@@ -66,8 +66,8 @@ function Test-CredentialGuard {
     try {
         $dg = Get-CimInstance -ClassName Win32_DeviceGuard -Namespace "root\Microsoft\Windows\DeviceGuard" -ErrorAction Stop
 
-        $cgConfigured = ($dg.SecurityServicesConfigured -contains 2)
-        $cgRunning    = ($dg.SecurityServicesRunning   -contains 2)
+        $cgConfigured = ($dg.SecurityServicesConfigured -contains 1)
+        $cgRunning    = ($dg.SecurityServicesRunning   -contains 1)
 
         if ($cgConfigured -and $cgRunning) {
             Add-Result $name "PASS" "Credential Guard appears to be enabled and running"
